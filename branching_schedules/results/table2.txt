@@ -1,0 +1,13 @@
+Table 2: base generation without optimization (2 targets)
+
+target          samples  pass rate  successes  unique  s/sample
+02_PDL1             200      7.0%         14       8      19.0
+04_IFNAR2           200     23.5%         47      38      21.4
+
+mean                                             23.0      20.2
+paper (19)                                       9.10      15.6
+
+unique = Foldseek clusters over designs passing all three criteria.
+Per-sample time is generation only and is the one column comparable
+across hardware; the paper's figure is an A100.
+Only 2 of 19 targets, so the mean is not comparable to 9.10.

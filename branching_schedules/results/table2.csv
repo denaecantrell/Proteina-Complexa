@@ -1,0 +1,3 @@
+target,samples,pass_rate,successes,n_unique,s_per_sample
+02_PDL1,200,0.07,14,8,19.0
+04_IFNAR2,200,0.235,47,38,21.4
