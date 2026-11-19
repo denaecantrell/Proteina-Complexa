@@ -1,0 +1,194 @@
+Task 1 is getting Proteina-Complexa running on the bluesclues server
+
+
+Machine Information
+---------------------
+
+bluesclues, 10x RTX 6000 Ada (48 GB each).
+
+Ubuntu 22.04.5, GLIBC 2.35. The repo requires 22.04 or newer.
+
+
+Conda Environment
+----------------------
+
+The env is built with conda plus pip, following the same order as
+env/build_uv_env.sh. The pins matter, particularly torch, because the
+torch-scatter wheel is compiled against a specific torch ABI.
+
+From env/constraints.txt:
+
+    torch==2.7.0+cu126
+    dm-haiku==0.0.12
+
+RTX 6000 Ada is sm_89, which torch 2.7.0+cu126 supports.
+
+
+1. Clone the repo
+---------------------
+
+The default branch is forked from dev, not main.
+
+
+2. Create the environment
+------------------------------
+
+    conda create -n complexa python=3.12 -y
+
+Python 3.12 is required by pyproject.toml.
+
+
+3. Bio binaries from bioconda
+---------------------------------
+
+foldseek and mmseqs2 are not Python packages and are not shipped with the repo.
+foldseek is needed to cluster successes.
+
+    conda install -n complexa -c conda-forge -c bioconda foldseek mmseqs2 -y
+
+
+4. PyTorch, pinned
+------------------------
+
+    conda activate complexa
+    cd ~/Proteina-Complexa
+    pip install --constraint env/constraints.txt torch==2.7.0+cu126 \
+        --index-url https://download.pytorch.org/whl/cu126
+
+
+5. The package and its dependencies
+---------------------------------------
+
+    pip install --constraint env/constraints.txt \
+        --extra-index-url https://download.pytorch.org/whl/cu126 -e .
+
+
+6. torch-scatter from a matching wheel
+------------------------------------------
+
+Binary only, so nothing compiles:
+
+    pip install --constraint env/constraints.txt torch_scatter --only-binary=:all: \
+        -f https://data.pyg.org/whl/torch-2.7.0+cu126.html
+
+This should resolve to torch_scatter-2.1.2+pt27cu126-cp312.
+
+
+7. The AF2 and JAX stack
+---------------------------
+
+Resolve these together. Installing them one at a time leaves newer chex or
+optax against an incompatible JAX.
+
+    pip install --constraint env/constraints.txt \
+        --extra-index-url https://download.pytorch.org/whl/cu126 \
+        -e ".[data-prep]" \
+        colabdesign==1.1.1 alphafold-colabfold==2.3.7 \
+        "jax[cuda12]==0.4.29" jaxlib==0.4.29+cuda12.cudnn91 flax==0.9.0 \
+        "rc-foundry[all]" \
+        -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+    pip install --constraint env/constraints.txt -e community_models/colabdesign
+    pip install --constraint env/constraints.txt graphein==1.7.7 --no-deps
+
+graphein goes in last and without dependencies, as upstream does it.
+
+Whole build takes about 25 minutes and roughly 20 GB.
+
+
+8. Check it
+--------------
+
+Use --af2, not --minimal. The --minimal path asserts that jax and friends are
+ABSENT, to confirm a minimal env was not over-installed, so it fails on a full
+install by design.
+
+    source branching_schedules/scripts/gpu_env.sh 0
+    python env/smoke_test.py --af2 --cuda
+
+Expect it to end with:
+
+    Environment smoke test passed: torch=2.7.0+cu126, device=cuda
+
+
+9. Configuration
+-------------------
+
+    complexa init
+
+This copies .env_example verbatim, so .env arrives full of placeholders. Three
+need fixing or the downloader writes several GB into a directory literally
+named /path/to:
+
+    LOCAL_CODE_PATH=$HOME/Proteina-Complexa
+    LOCAL_DATA_PATH=$HOME/complexa_data
+    UV_VENV=$HOME/miniconda3/envs/complexa
+
+UV_VENV is the odd one. .env resolves FOLDSEEK_EXEC through
+${UV_VENV}/bin/foldseek, so under conda that path does not exist and validation
+reports foldseek missing even though it is installed. Setting that one variable
+fixes foldseek and mmseqs together.
+
+Then generate env.sh and source it:
+
+    complexa init uv
+    source env.sh
+
+Most complexa subcommands refuse to run until env.sh is sourced.
+
+
+10. Model weights
+--------------------
+
+About 12 GB. Only the protein binder path is needed; ligand, AME and RF3 are
+for small-molecule and enzyme work.
+
+    complexa-download --complexa --af2 --pmpnn
+
+These land in ckpts/, not checkpoints/, despite .env calling it
+LOCAL_CHECKPOINT_PATH. The local pipeline configs already point at ./ckpts, so
+nothing needs editing.
+
+Check what arrived:
+
+    complexa-download --status
+
+Complexa (Protein), AlphaFold2 and ProteinMPNN should read Installed.
+
+
+11. Validate
+----------------
+
+    complexa validate design configs/search_binder_local_pipeline.yaml
+
+Six checks pass: .env, DATA_PATH, the config, both checkpoints, foldseek. One
+warning remains for sc, the shape complementarity binary, which upstream does
+not ship. It is not used by any success criterion in Table 2 or Figure 7, so it
+can be ignored.
+
+
+12. First generation
+----------------------
+
+Pin one GPU by UUID and stop JAX taking the whole card, then generate four
+binders against PD-L1:
+
+    nvidia-smi --query-gpu=index,uuid,memory.used --format=csv,noheader
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+    export CUDA_VISIBLE_DEVICES=GPU-<uuid>
+    export XLA_PYTHON_CLIENT_PREALLOCATE=false
+    export XLA_PYTHON_CLIENT_MEM_FRACTION=0.3
+
+    complexa generate configs/search_binder_local_pipeline.yaml \
+        ++run_name=smoketest \
+        ++generation.task_name=02_PDL1 \
+        ++generation.search.algorithm=single-pass
+
+About 2.5 minutes. Output in inference/, four PDBs plus rewards_*.csv. Each PDB
+is a complex: chain A is the target, chain B the designed binder.
+
+JAX preallocates roughly 75% of the device unless told otherwise, and the
+generator and the AF2 reward share one card. Without those two exports,
+04_IFNAR2 dies with CUDA OOM at batch 8 of 13 after about 65 minutes, PyTorch
+holding 7.6 GB of a 47 GB card while JAX holds the rest. Longer binders hit it
+first because the failing tensor is quadratic in sequence length.

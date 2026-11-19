@@ -1,0 +1,170 @@
+Figure 7 reproduction for test-time scaling of inference-time optimization
+
+What Figure 7 shows
+-------------------
+
+Table 2 asks whether the pretrained generator is any good on its own. Figure 7
+asks what happens when you spend extra compute at inference time searching for
+better designs, and which search algorithm spends it best.
+
+The x-axis is test-time GPU hours, not sample count. This is the key difference
+from Table 2, which fixes 200 samples per target and reports one number. Figure
+7 fixes a time budget instead and plots a curve, because the algorithms consume
+compute at very different rates: one beam search step evaluates sixteen
+candidates, while best-of-n just draws another sample.
+
+The y-axis is average unique successes, meaning designs passing all three
+criteria and then clustered with Foldseek, so 200 copies of one good binder
+count once.
+
+Two panels, 12 easy targets and 7 hard targets, and they do not agree:
+
+    easy targets    Best-of-N ~137, Beam Search ~104, FK Steering ~97,
+                    MCTS ~80, at 16 GPU hours
+
+    hard targets    Beam Search ~26, FK Steering ~25, MCTS ~19,
+                    Best-of-N ~18, at 32 GPU hours
+
+That inversion is the most interesting thing in the figure. On easy targets,
+drawing more independent samples beats branching. On hard targets, branching
+beats drawing more samples. Best-of-N goes from first place to last.
+
+This matters directly for Task 3. If branching only pays off on hard targets,
+then testing branching schedules on easy targets means tuning a strategy that is
+already losing there, and any difference between schedules would be noise around
+a method that should not be used in that regime.
+
+
+What the paper does
+-------------------
+
+    19 targets, 12 easy and 7 hard
+    budget caps of 16 GPU hours per easy target, 32 per hard target
+    five algorithms, plus the hallucination baselines BindCraft and BoltzDesign
+    Best-of-N scaled up to 51,200 samples
+    beam search and FK steering repeat the entire search until the clock expires
+    GPU hours include generation AND evaluation time
+    reward is interface pAE alone
+    N=4, L=4, K=100 over 400 denoising steps; FKS inverse temperature beta=10
+
+Measured on an A100.
+
+
+What we are doing differently, and why
+--------------------------------------
+
+The difference is entirely compute. The paper's protocol is roughly
+
+    16 GPU-h x 12 easy  +  32 GPU-h x 7 hard  =  416 GPU-hours per algorithm
+
+and with five algorithms that is around 2,000 GPU-hours. On two shared cards
+that is several months of wall-clock. It is not reachable, and no amount of
+careful configuration makes it reachable.
+
+So the experiment is restructured around a question that is answerable at small
+scale rather than a figure that is not. Three cuts:
+
+    targets      2 instead of 19, one easy and one hard, chosen so the
+                 easy/hard inversion can still be observed
+    algorithms   3 instead of 5 plus baselines: best-of-n, beam-search,
+                 fk-steering. MCTS and the hallucination baselines are dropped
+                 because they are not what this project is about
+    budget       4 GPU-hours per (target, algorithm) instead of 16 or 32
+
+That is 2 x 3 x 4 = 24 GPU-hours, about 12 hours of wall-clock on two cards.
+
+Everything else is left at the paper's values. N=4, L=4, step_checkpoints at
+100-step spacing over 400 denoising steps, and FKS temperature 0.1 are already
+the repository defaults and already match Appendix H.2, so the stock config is
+the paper's condition and needs no changes.
+
+What this costs us: the absolute numbers will be far below the published curves,
+because we stop at 4 GPU-hours where the paper runs to 16 or 32, and because an
+RTX 6000 Ada hour buys roughly 0.77 of an A100 hour on this workload. The
+y-values are not comparable to the figure.
+
+What survives: the ORDERING of the algorithms at matched budget, and whether
+that ordering inverts between the easy and the hard target. Ordering is a
+within-experiment comparison, so it does not depend on the hardware or on
+reaching the paper's budgets. That is the claim worth testing.
+
+
+What the experiment tests
+-------------------------
+
+    easy target   does best-of-n beat beam-search and fk-steering
+    hard target   does beam-search beat best-of-n
+
+If both hold, Figure 7's qualitative structure reproduces at 1/80th of the
+compute, and Task 3 should use hard targets.
+
+If the easy result holds and the hard one does not, that is a statement about
+scale: 4 GPU-hours is not enough for branching to pay off, and the crossover
+needs a larger budget to appear.
+
+
+Seeds
+-----
+
+The pipeline config pins seed: 5. Repeating a run without overriding it
+regenerates byte-identical structures, so a budget sweep accumulates duplicates
+and the unique-success curve goes flat while the raw count climbs. That flatness
+looks like genuine diversity saturation and is not.
+
+Every repeat must pass a distinct ++seed. Check this while a sweep is running:
+the number of distinct seeds in the ledger should equal the number of runs, and
+unique successes should rise rather than plateau.
+
+
+Running it
+----------
+
+Pick two free cards and confirm they are actually idle; cards here turn over on
+a scale of hours.
+
+    nvidia-smi --query-gpu=index,uuid,memory.used,temperature.gpu --format=csv,noheader
+
+One target per card, each walking its three algorithms to the budget, with the
+seed varied per repeat and a curve point recorded every GPU-hour. The sweep
+driver belongs in branching_schedules/scripts/ rather than /tmp, so the run is
+reproducible from the repository alone.
+
+Per (target, algorithm) the loop is:
+
+    complexa generate configs/search_binder_local_pipeline.yaml \
+        ++run_name=f7_<target>_<algo>_s<seed> \
+        ++generation.task_name=<target> \
+        ++generation.search.algorithm=<algo> \
+        ++seed=<distinct seed>
+
+repeated until the cumulative elapsed time for that pair reaches the budget,
+recording elapsed and cumulative seconds per repeat in a ledger.
+
+The evaluate and analyze stages are then run per target exactly as in
+table_2_generation.txt, and unique successes are read from the Foldseek cluster
+count.
+
+A possible shortcut, with a caveat: in the Table 2 verification run, scRMSD
+rejected nothing, so ipAE and pLDDT from the generate stage alone gave the same
+success set as the full pipeline. If that holds here it removes the evaluate
+stage and cuts roughly 45 % of the compute. It was observed on two easy targets
+only, and hard targets are where refolding is most likely to fail, so it must be
+checked on the hard target before being relied on.
+
+
+Environment
+-----------
+
+Same as Task 1. Pin one GPU by UUID, and set the JAX and PyTorch memory
+variables before any run, because the generator and the AF2 reward share one
+card:
+
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+    export CUDA_VISIBLE_DEVICES=GPU-<uuid>
+    export XLA_PYTHON_CLIENT_PREALLOCATE=false
+    export XLA_PYTHON_CLIENT_MEM_FRACTION=0.3
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+Long sweeps go in tmux. /bluesclues-data runs near full and is shared, so check
+df -h before starting and be aware a sweep can die on a full disk through no
+fault of its own.

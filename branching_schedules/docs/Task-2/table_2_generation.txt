@@ -1,0 +1,245 @@
+Table 2 reproduction: evaluate the base generation without optimization
+
+There are three stages: generate >>> evaluate >>> analyze. 
+These are run them in order, on only one GPU for now.
+Verified initial working test on bluesclues server, 11-17-2026.
+
+
+0. Environment
+-----------------
+
+    source ~/miniconda3/etc/profile.d/conda.sh
+    conda activate complexa
+    cd ~/Proteina-Complexa
+    source env.sh
+
+We first pin one GPU by UUID, and stop JAX taking the whole card. 
+Both the generator and the AF2 reward share the device; without these, 
+04_IFNAR2 dies with CUDA OOM at about batch 8 of 13, PyTorch is holding 
+7.6 GB of 47 while JAX holds the rest.
+
+    nvidia-smi --query-gpu=index,uuid,memory.used --format=csv,noheader
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+    export CUDA_VISIBLE_DEVICES=GPU-<uuid of a free card>
+    export XLA_PYTHON_CLIENT_PREALLOCATE=false
+    export XLA_PYTHON_CLIENT_MEM_FRACTION=0.3
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+
+1. Generate
+-----------------
+
+Table 2 is 200 samples per target with no optimization, so single-pass.
+
+    complexa generate configs/search_binder_local_pipeline.yaml \
+        ++run_name=table2_02_PDL1 \
+        ++generation.task_name=02_PDL1 \
+        ++generation.search.algorithm=single-pass \
+        ++generation.dataloader.dataset.nres.nsamples=200
+
+Examine 200 samples in ONE run. Repeating a 4-sample run 50 times does not work:
+configs/search_binder_local_pipeline.yaml pins seed: 5, so every repeat
+regenerates byte-identical structures. Within a single run the samples do vary.
+To repeat a run deliberately, override ++seed per run.
+
+Output: ./inference/search_binder_local_pipeline_02_PDL1_table2_02_PDL1/
+Timing for the Table 2 "Time [s]" column: timing_0.csv in that directory.
+
+
+2. Evaluate
+-----------------
+
+Refolds each design and produces the metrics the success criteria need,
+including scRMSD, which the generate stage does not compute.
+
+    complexa evaluate configs/evaluate.yaml \
+        ++run_name=table2_02_PDL1 \
+        ++dataset.task_name=02_PDL1 \
+        ++sample_storage_path=./inference/search_binder_local_pipeline_02_PDL1_table2_02_PDL1 \
+        ++eval_njobs=1
+
+configs/evaluate.yaml ships eval_njobs: 20 and placeholder values for
+sample_storage_path and dataset.task_name. Override all three. eval_njobs must
+be 1 for a single GPU.
+
+Output: ./evaluation_results/binder_eval_table2_02_PDL1/binder_results_evaluate_0.csv
+Columns used by the criteria: self_complex_i_pAE, self_complex_pLDDT,
+self_binder_scRMSD.
+
+
+3. Analyze
+-----------------
+
+Applies the thresholds, clusters survivors with Foldseek, aggregates.
+
+    complexa analyze configs/analyze.yaml \
+        ++run_name=table2_02_PDL1 \
+        ++results_dir=./evaluation_results/binder_eval_table2_02_PDL1 \
+        ++base_config_name=evaluate
+
+++base_config_name=evaluate is required and not obvious. analyze.py:509 builds
+its input filename as binder_results_{config_name}_ and the CLI injects
+config_name=analyze, so it searches for binder_results_analyze_[0-9]+.csv while
+evaluate has written binder_results_evaluate_0.csv. Without the override it
+fails with "No result files found", having located the directory correctly.
+
+++results_dir is also required: analyze.yaml does not set it, so analyze builds
+./evaluation_results/analyze_<run_name>, which nothing writes to.
+
+Outputs in the results_dir:
+    success_criteria_protein_binder.json            thresholds actually applied
+    all_successes_protein_binder_self.csv           designs passing all criteria
+    overall_binder_performance_evaluate_aggregated.csv
+    clusters_binder_all_generated/                  Foldseek clustering
+    timing_summary.csv
+
+
+Success criteria
+-----------------
+
+From success_criteria_protein_binder.json, matching the paper:
+
+    i_pAE      <= 7.0    scale 31.0   column prefix complex
+    pLDDT      >= 0.9    scale 1.0    column prefix complex
+    scRMSD_ca  <  1.5    scale 1.0    column prefix binder
+
+i_pAE carries scale 31.0, so a raw CSV value of 0.2258 is the 7.0 A cutoff.
+Multiply the column by 31 to read it in angstroms.
+
+Unique successes are Foldseek clusters over the passing designs, not the raw
+count. Cluster the binder chain only: generated PDBs hold the target and the
+binder as separate chains, and clustering the complex counts both.
+
+
+Columns of Table 2 this produces
+--------------------------------
+
+    Unique Successes (Self)   yes, from the analyze stage
+    Time [s]                  yes, timing_0.csv / timing_summary.csv
+    Unique Successes (MPNN)   needs ProteinMPNN redesign enabled in evaluate
+    Novelty                   needs a PDB reference database for the TM search
+    # Times Best Method       not obtainable: it is a per-target win count
+                              against RFDiffusion, Protpardelle-1c and APM,
+                              which have to be run separately
+
+
+First result (Test result)
+---------------------------
+
+4 samples on 02_PDL1, all three criteria: 0 successes.
+
+     i_pAE   pLDDT   scRMSD
+1    0.249   0.934   0.443
+2    0.517   0.832   0.728
+3    0.466   0.840   0.646
+4    0.628   0.800   0.368
+
+All four pass scRMSD comfortably. The binding term is what fails, where the best
+sample is 0.249, 7.72 A against the 7.0 A cutoff. Four samples is far
+below the 200 Table 2 uses, so this says nothing about the rate; it only
+confirms the pipeline applies all three criteria end to end.
+
+
+-----------------------------------------
+Running the experiment on bluesclues!!!
+-----------------------------------------
+
+Running the entire experiment on a single GPU at one time:
+
+Both targets run sequentially through all three stages. Maybe 1 hour-ish to
+generate each target and, extrapolating from a 4-sample run, a few hours to
+evaluate each, so expect this to take most of a working day on one card.
+
+In a detached tmux session so a dropped ssh does not kill it:
+
+    tmux new-session -d -s table2 'cd ~/Proteina-Complexa && source env.sh && \
+      export CUDA_DEVICE_ORDER=PCI_BUS_ID \
+           R-------------------------
+  CUDA_VISIBLE_DEVICES=GPU-3bce0af6-2923-5714-fdec-0343b7eb0acc \
+             XLA_PYTHON_CLIENT_PREALLOCATE=false \
+             XLA_PYTHON_CLIENT_MEM_FRACTION=0.3 \
+             PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
+      for T in 02_PDL1 04_IFNAR2; do \
+        RUN=table2_$T; \
+        DIR=./inference/search_binder_local_pipeline_${T}_${RUN}; \
+        echo "~~~ $T generate! ~~~"; \
+        complexa generate configs/search_binder_local_pipeline.yaml \
+          ++run_name=$RUN ++generation.task_name=$T \
+          ++generation.search.algorithm=single-pass \
+          ++generation.dataloader.dataset.nres.nsamples=200 || continue; \
+        echo "~~~ $T evaluate! ~~~"; \
+        complexa evaluate configs/evaluate.yaml \
+          ++run_name=$RUN ++dataset.task_name=$T \
+          ++sample_storage_path=$DIR ++eval_njobs=1 || continue; \
+        echo "~~~ $T analyze! ~~~"; \
+        complexa analyze configs/analyze.yaml \
+          ++run_name=$RUN \
+          ++results_dir=./evaluation_results/binder_eval_$RUN \
+          ++base_config_name=evaluate; \
+      done; echo "~~~ Table 2 is done!!! ~~~"' 2>&1 | tee ~/table2_run.log
+
+Watch it with:
+
+    tmux attach -t table2          detach again with Ctrl-b then d
+    tail -f ~/table2_run.log
+
+Note: Seeing "|| continue" means a failure on one target does not silently feed an empty
+directory into the next stage; it skips to the next target instead.
+
+Per-target results end up in:
+
+    ./evaluation_results/binder_eval_table2_<target>/
+        success_criteria_protein_binder.json
+        all_successes_protein_binder_self.csv
+        overall_binder_performance_evaluate_aggregated.csv
+        clusters_binder_all_generated/
+        timing_summary.csv
+
+Unique successes for the Self column is the cluster count from
+clusters_binder_all_generated.
+
+
+-----------------------------------------
+What the verification run actually showed
+-----------------------------------------
+
+Only two targets were run, 02_PDL1 and 04_IFNAR2, both from the paper's easy
+set. This was a verification that the pipeline reproduces the paper's procedure,
+not a reproduction of Table 2 itself, which averages 19 targets.
+
+Cost: 4.0 GPU-hours total, 2 hours 8 minutes of wall-clock with the two targets
+running in parallel on separate cards.
+
+    02_PDL1     generate 64 min   evaluate 49 min   analyze 1.4 min
+    04_IFNAR2   generate 72 min   evaluate 55 min   analyze 1.4 min
+
+Results, 200 samples per target, all three success criteria applied by the
+analyze stage:
+
+    target       samples   pass rate   successes   unique   s/sample
+    02_PDL1          200       7.0 %          14        8       19.2
+    04_IFNAR2        200      23.5 %          47       38       21.5
+    mean                                             23.0       20.4
+
+    paper, 19 targets                                 9.10      15.6
+
+The verification succeeded. The environment runs the full generate, evaluate and
+analyze pipeline end to end, applies all three criteria from the paper, and
+produces per-sample times within 1.3x of the published figure on different
+hardware (RTX 6000 Ada against the paper's A100). That ratio is the cleanest
+evidence the installation is correct, because it does not depend on thresholds,
+clustering parameters or which targets were chosen.
+
+Two things worth recording about the numbers themselves.
+
+scRMSD filtered nothing. All 14 successes for 02_PDL1 and all 47 for 04_IFNAR2
+passed scRMSD, so the counts are identical to what ipAE and pLDDT alone give.
+The binding term is what rejects designs here, not the refolding term.
+
+The mean of 23.0 against the paper's 9.10 is not a meaningful comparison. Both
+targets are from the easy set while the paper's figure averages 12 easy and 7
+hard, so a higher number is expected. More importantly the two targets differ by
+a factor of nearly five, 8 against 38, which is larger than the quantity being
+compared. A mean over two targets says very little. Comparing against the
+paper's per-target numbers in Appendix I would be more informative than against
+the 19-target mean.
